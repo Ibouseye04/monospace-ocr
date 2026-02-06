@@ -400,7 +400,7 @@ def main():
                 all_gt_visuals,
                 all_gt_labels,
                 ground_truth_averages,
-                "TRAINING DATA: Avg vs Most Deviant",
+                "TRAINING TYPO CHECK: Avg vs Max Outlier",
             )
 
         X = torch.tensor(all_gt_visuals, dtype=torch.float32).unsqueeze(1) / 255.0
@@ -487,7 +487,7 @@ def main():
             visuals,
             pred_indices,
             inf_averages,
-            "Inference Bucket Deviations",
+            "Inference Results: Max Outliers",
             save_path=pf_path,
         )
 
