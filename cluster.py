@@ -37,21 +37,33 @@ def log(msg):
 class SimpleCNN(nn.Module):
     def __init__(self, num_classes):
         super(SimpleCNN, self).__init__()
+        # Increasing to 3 blocks to capture more complex shapes
         self.conv = nn.Sequential(
+            # Block 1: 32x32 -> 16x16
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2),
+
+            # Block 2: 16x16 -> 8x8
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            # Block 3: 8x8 -> 4x4
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
             nn.MaxPool2d(2)
         )
+
         self.fc = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(64 * 8 * 8, 256),
+            nn.Linear(128 * 4 * 4, 512),
             nn.ReLU(),
-            nn.Linear(256, num_classes)
+            nn.Dropout(0.3),  # Helps the model generalize better
+            nn.Linear(512, num_classes)
         )
 
     def forward(self, x):
@@ -130,18 +142,12 @@ def extract_cells(image_path, num_lines, debug=False):
     return np.array(cells)
 
 def parse_training_file(path, line_offset):
-    """
-    Parses a text file, validating line lengths and alphabet contents.
-    line_offset: Used to report correct (1,1) indexed image grid coordinates.
-    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Training file not found: {path}")
-    
+
     with open(path, "r", encoding="utf-8") as f:
-        # We use splitlines to preserve individual line integrity
         raw_lines = f.read().splitlines()
-    
-    # Filter out trailing empty lines, but keep internal ones if they exist
+
     while raw_lines and not raw_lines[-1].strip():
         raw_lines.pop()
 
@@ -154,7 +160,7 @@ def parse_training_file(path, line_offset):
                 f"Format Error in {path}: Line {r_idx + 1} (Grid Line {r_idx + 1 + line_offset}) "
                 f"has length {len(line)}, but expected {EXPECTED_COLS}."
             )
-        
+
         for c_idx, char in enumerate(line):
             if char not in char_to_idx:
                 raise ValueError(
@@ -162,7 +168,7 @@ def parse_training_file(path, line_offset):
                     f"at Grid Coordinate ({r_idx + 1 + line_offset}, {c_idx + 1})."
                 )
             labels.append(char_to_idx[char])
-            
+
     return np.array(labels), len(raw_lines)
 
 def calculate_bucket_averages(visuals, labels):
@@ -212,12 +218,13 @@ def main():
     parser.add_argument("bottom_train_path", nargs='?', default=None, help="Optional: Bottom N lines of ground truth")
     parser.add_argument("-d", "--debug", action="store_true")
     parser.add_argument("-q", "--quiet", action="store_true")
+    parser.add_argument("-o", "--output", help="Path to write output instead of stdout")
     parser.add_argument("--lines", type=int, default=65, help="Total grid lines in image")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SimpleCNN(CLUSTERS).to(device)
-    
+
     visuals = extract_cells(args.image, args.lines, debug=args.debug)
     if visuals is None: return
 
@@ -225,37 +232,32 @@ def main():
     gt_visuals_list = []
 
     if args.train_path:
-        # Process Top Training File
         labels_top, n_lines_top = parse_training_file(args.train_path, 0)
         gt_labels_list.append(labels_top)
         gt_visuals_list.append(visuals[:n_lines_top * EXPECTED_COLS])
         log(f"Loaded {n_lines_top} lines from top training file.")
 
         if args.bottom_train_path:
-            # First peek at the file to see how many lines it has to calculate offset
             with open(args.bottom_train_path, "r", encoding="utf-8") as f:
                 n_lines_bot = len([l for l in f.read().splitlines() if l.strip()])
-            
+
             offset = args.lines - n_lines_bot
             if offset < n_lines_top:
                 log("Warning: Top and Bottom training sets overlap.")
-            
+
             labels_bot, _ = parse_training_file(args.bottom_train_path, offset)
             gt_labels_list.append(labels_bot)
             gt_visuals_list.append(visuals[offset * EXPECTED_COLS : (offset + n_lines_bot) * EXPECTED_COLS])
             log(f"Loaded {n_lines_bot} lines from bottom training file (Offset: {offset}).")
 
-        # Combine training data
         all_gt_labels = np.concatenate(gt_labels_list)
         all_gt_visuals = np.concatenate(gt_visuals_list)
-        
-        # Calculate averages for debugging
+
         ground_truth_averages = calculate_bucket_averages(all_gt_visuals, all_gt_labels)
         if args.debug:
             show_outliers(all_gt_visuals, all_gt_labels, ground_truth_averages,
                           "TRAINING DATA: Avg vs Most Deviant")
 
-        # Training Loop
         X = torch.tensor(all_gt_visuals, dtype=torch.float32).unsqueeze(1) / 255.0
         Y = torch.tensor(all_gt_labels, dtype=torch.long)
         train_idx, val_idx = train_test_split(np.arange(len(Y)), test_size=0.1, random_state=42)
@@ -288,11 +290,16 @@ def main():
     pred_indices = np.concatenate(all_preds)
 
     if not args.quiet:
-        for r in range(args.lines):
-            row = pred_indices[r*EXPECTED_COLS : (r+1)*EXPECTED_COLS]
-            sys.stdout.write("".join([ALPHABET[i] for i in row]) + "\n")
+        # Redirect output if -o is provided
+        out_f = open(args.output, "w", encoding="utf-8") if args.output else sys.stdout
+        try:
+            for r in range(args.lines):
+                row = pred_indices[r*EXPECTED_COLS : (r+1)*EXPECTED_COLS]
+                out_f.write("".join([ALPHABET[i] for i in row]) + "\n")
+        finally:
+            if args.output:
+                out_f.close()
 
-    # Final visual check
     inf_averages = calculate_bucket_averages(visuals, pred_indices)
     if args.debug:
         show_outliers(visuals, pred_indices, inf_averages, "Inference Bucket Deviations")
@@ -300,6 +307,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, FileNotFoundError) as e:
+    except (ValueError, FileNotFoundError, OSError) as e:
         log(str(e))
         sys.exit(1)
