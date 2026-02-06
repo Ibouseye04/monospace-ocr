@@ -41,7 +41,7 @@ class SimpleCNN(nn.Module):
         super(SimpleCNN, self).__init__()
         # Input is 1 (gray) + 2 (coords) = 3 channels
         self.conv = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.Conv2d(3, 32, kernel_size=5, padding=2),
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2), # 16x16
