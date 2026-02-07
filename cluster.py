@@ -351,6 +351,17 @@ def main():
     parser.add_argument("-q", "--quiet", action="store_true")
     parser.add_argument("-o", "--output", help="Path to write output instead of stdout")
     parser.add_argument(
+        "--jsonl", default=None, help="Path to write per-glyph JSONL predictions"
+    )
+    parser.add_argument(
+        "--page-id", dest="page_id", default=None,
+        help="Page identifier for JSONL output (default: derived from image filename)",
+    )
+    parser.add_argument(
+        "--save-glyphs", default=None,
+        help="Directory to save individual glyph crops (for training disambiguator)",
+    )
+    parser.add_argument(
         "--lines", type=int, default=65, help="Total grid lines in image"
     )
     args = parser.parse_args()
@@ -481,10 +492,15 @@ def main():
     model.eval()
     X_all = torch.tensor(visuals, dtype=torch.float32).unsqueeze(1).to(device) / 255.0
     all_preds = []
+    all_logits = []
     with torch.no_grad():
         for i in range(0, len(X_all), 128):
-            all_preds.append(model(X_all[i : i + 128]).argmax(1).cpu().numpy())
+            logits = model(X_all[i : i + 128])
+            all_logits.append(logits.cpu())
+            all_preds.append(logits.argmax(1).cpu().numpy())
     pred_indices = np.concatenate(all_preds)
+    all_logits = torch.cat(all_logits, dim=0)  # (N, CLUSTERS)
+    all_probs = torch.softmax(all_logits, dim=1).numpy()
 
     if not args.quiet:
         out_f = open(args.output, "w", encoding="utf-8") if args.output else sys.stdout
@@ -495,6 +511,57 @@ def main():
         finally:
             if args.output:
                 out_f.close()
+
+    # --- JSONL per-glyph output ---
+    if args.jsonl or args.save_glyphs:
+        page_id = args.page_id or os.path.splitext(os.path.basename(args.image))[0]
+
+        if args.save_glyphs:
+            os.makedirs(args.save_glyphs, exist_ok=True)
+
+        jsonl_f = open(args.jsonl, "w", encoding="utf-8") if args.jsonl else None
+        try:
+            topk_k = min(6, CLUSTERS)
+            for idx in range(len(pred_indices)):
+                r = idx // EXPECTED_COLS
+                c = idx % EXPECTED_COLS
+                probs = all_probs[idx]
+                top_indices = np.argsort(probs)[::-1][:topk_k]
+                topk = [[ALPHABET[ti], float(probs[ti])] for ti in top_indices]
+                pred_char = ALPHABET[pred_indices[idx]]
+                pred_score = float(probs[pred_indices[idx]])
+
+                glyph_path = None
+                if args.save_glyphs:
+                    glyph_path = os.path.join(
+                        args.save_glyphs, f"{page_id}_l{r}_g{c}.png"
+                    )
+                    cv2.imwrite(glyph_path, visuals[idx])
+
+                if jsonl_f:
+                    row = {
+                        "page_id": page_id,
+                        "line_id": r,
+                        "glyph_idx": c,
+                        "bbox": [
+                            int(detected_params[0] + c * detected_params[2] / EXPECTED_COLS),
+                            int(detected_params[1] + r * detected_params[3] / args.lines),
+                            int(detected_params[2] / EXPECTED_COLS),
+                            int(detected_params[3] / args.lines),
+                        ],
+                        "pred": pred_char,
+                        "pred_score": round(pred_score, 6),
+                        "topk": [[ch, round(s, 6)] for ch, s in topk],
+                    }
+                    if glyph_path:
+                        row["img_path"] = glyph_path
+                    jsonl_f.write(json.dumps(row) + "\n")
+        finally:
+            if jsonl_f:
+                jsonl_f.close()
+                log(f"Wrote per-glyph JSONL to {args.jsonl}")
+        if args.save_glyphs:
+            log(f"Saved glyph crops to {args.save_glyphs}")
 
     if args.debug:
         inf_averages = calculate_bucket_averages(visuals, pred_indices)

@@ -4,3 +4,10 @@ target/
 *.pdf
 grid_config.json
 weights
+
+# Tools output
+runs/
+buckets/
+buckets_aug/
+*.pkl
+analysis_report.json
