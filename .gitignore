@@ -4,3 +4,5 @@ target/
 *.pdf
 grid_config.json
 weights
+char_averages.npy
+__pycache__/
