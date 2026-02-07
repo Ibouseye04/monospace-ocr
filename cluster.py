@@ -34,6 +34,8 @@ EXPECTED_COLS = 78
 TARGET_CELL_SIZE = (32, 32)
 WEIGHTS_PATH = "./weights"
 CONFIG_PATH = "./grid_config.json"
+AVERAGES_PATH = "./char_averages.npy"
+CONFUSABLE_PAIRS = [("1", "l"), ("0", "O"), ("I", "l")]
 
 
 def log(msg):
@@ -88,6 +90,39 @@ class SimpleCNN(nn.Module):
     def forward(self, x):
         x = self.add_coords(x)
         return self.fc(self.conv(x))
+
+
+class ConfusionAwareLoss(nn.Module):
+    """CE loss + extra penalty for assigning probability to a confusable twin.
+
+    For each confusable pair (a, b): when the true class is 'a', the model
+    pays an additional cost proportional to the probability it assigns to 'b'
+    (and vice versa).  This directly pushes the decision boundary apart for
+    the hardest pairs without affecting unrelated classes.
+    """
+
+    def __init__(self, confusable_pairs, penalty_weight=4.0):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(reduction="none")
+        self.penalty_weight = penalty_weight
+        char_to_idx = {c: i for i, c in enumerate(ALPHABET)}
+        self.pairs = []
+        for a, b in confusable_pairs:
+            if a in char_to_idx and b in char_to_idx:
+                self.pairs.append((char_to_idx[a], char_to_idx[b]))
+
+    def forward(self, logits, targets):
+        ce_loss = self.ce(logits, targets)
+        probs = torch.softmax(logits, dim=1)
+        penalty = torch.zeros_like(ce_loss)
+        for idx_a, idx_b in self.pairs:
+            mask_a = targets == idx_a
+            if mask_a.any():
+                penalty[mask_a] += probs[mask_a, idx_b]
+            mask_b = targets == idx_b
+            if mask_b.any():
+                penalty[mask_b] += probs[mask_b, idx_a]
+        return (ce_loss + self.penalty_weight * penalty).mean()
 
 
 def normalize_character_soft(raw_cell, h_step):
@@ -335,6 +370,79 @@ def show_outliers(
     return overall_max_mse
 
 
+def oversample_confusables(X, Y, factor=3):
+    """Repeat examples of confusable characters so they dominate more batches."""
+    char_to_idx = {c: i for i, c in enumerate(ALPHABET)}
+    target_indices = set()
+    for a, b in CONFUSABLE_PAIRS:
+        target_indices.add(char_to_idx[a])
+        target_indices.add(char_to_idx[b])
+    extra_X, extra_Y = [], []
+    for idx in target_indices:
+        mask = Y == idx
+        if mask.any():
+            for _ in range(factor - 1):
+                extra_X.append(X[mask])
+                extra_Y.append(Y[mask])
+    if extra_X:
+        return torch.cat([X] + extra_X), torch.cat([Y] + extra_Y)
+    return X, Y
+
+
+def refine_confusables(logits_all, visuals, ref_averages, threshold=0.4):
+    """When the model is uncertain between confusable twins, use a linear
+    discriminant (difference of class-average templates) as a tiebreaker.
+
+    This focuses on the pixels where the two classes *actually differ*
+    (e.g. the top flag on '1') and ignores the shared vertical stroke.
+    """
+    probs = torch.softmax(logits_all, dim=1).numpy()
+    preds = logits_all.argmax(dim=1).numpy()
+    char_to_idx = {c: i for i, c in enumerate(ALPHABET)}
+    n_refined = 0
+    for a, b in CONFUSABLE_PAIRS:
+        idx_a, idx_b = char_to_idx[a], char_to_idx[b]
+        avg_a = ref_averages[idx_a].astype(float)
+        avg_b = ref_averages[idx_b].astype(float)
+        if avg_a.sum() == 0 or avg_b.sum() == 0:
+            continue
+        discriminant = avg_a - avg_b
+        midpoint = (avg_a + avg_b) / 2.0
+        for i in range(len(preds)):
+            if preds[i] not in (idx_a, idx_b):
+                continue
+            p_a, p_b = probs[i, idx_a], probs[i, idx_b]
+            if abs(p_a - p_b) < threshold:
+                cell = visuals[i].astype(float)
+                score = np.sum((cell - midpoint) * discriminant)
+                best = idx_a if score > 0 else idx_b
+                if best != preds[i]:
+                    n_refined += 1
+                    preds[i] = best
+    if n_refined > 0:
+        log(f"Refined {n_refined} confusable predictions via template matching.")
+    return preds
+
+
+def log_confusable_stats(model, X, Y, device):
+    """Print per-pair accuracy for confusable characters."""
+    model.eval()
+    with torch.no_grad():
+        preds = model(X.to(device)).argmax(1).cpu()
+    char_to_idx = {c: i for i, c in enumerate(ALPHABET)}
+    log("Confusable pair accuracy:")
+    for a, b in CONFUSABLE_PAIRS:
+        idx_a, idx_b = char_to_idx[a], char_to_idx[b]
+        for label, other, li, oi in [(a, b, idx_a, idx_b), (b, a, idx_b, idx_a)]:
+            mask = Y == li
+            if mask.any():
+                n = mask.sum().item()
+                correct = (preds[mask] == li).sum().item()
+                confused = (preds[mask] == oi).sum().item()
+                log(f"  '{label}' (n={n}): {correct}/{n} correct, "
+                    f"{confused} confused as '{other}'")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("image", help="Path to input image")
@@ -426,13 +534,15 @@ def main():
         train_idx, _ = train_test_split(
             np.arange(len(Y)), test_size=0.1, random_state=42
         )
+        X_train, Y_train = oversample_confusables(X[train_idx], Y[train_idx])
+        log(f"Training set: {len(Y[train_idx])} -> {len(Y_train)} after oversampling confusables.")
         train_loader = DataLoader(
-            TensorDataset(X[train_idx], Y[train_idx]), batch_size=64, shuffle=True
+            TensorDataset(X_train, Y_train), batch_size=64, shuffle=True
         )
 
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.2)
-        criterion = nn.CrossEntropyLoss()
+        criterion = ConfusionAwareLoss(CONFUSABLE_PAIRS, penalty_weight=4.0)
         for epoch in range(53):
             model.train()
             l_sum = 0
@@ -457,9 +567,11 @@ def main():
                 f"Epoch {epoch + 1:02d} | Loss: {l_sum / (2 * len(train_loader)):.4f} | LR: {curr_lr:.5f}"
             )
 
-        # Save Weights
+        log_confusable_stats(model, X, Y, device)
+
+        # Save Weights + Averages + Grid Config
         torch.save(model.state_dict(), WEIGHTS_PATH)
-        # Save Grid Config (Memorization)
+        np.save(AVERAGES_PATH, ground_truth_averages)
         with open(CONFIG_PATH, "w") as f:
             json.dump(
                 {
@@ -470,7 +582,7 @@ def main():
                 },
                 f,
             )
-        log(f"Memorized grid and saved weights.")
+        log(f"Memorized grid, saved weights and character averages.")
     else:
         # --- INFERENCE MODE ---
         if not os.path.exists(WEIGHTS_PATH):
@@ -480,11 +592,20 @@ def main():
 
     model.eval()
     X_all = torch.tensor(visuals, dtype=torch.float32).unsqueeze(1).to(device) / 255.0
-    all_preds = []
+    all_logits = []
     with torch.no_grad():
         for i in range(0, len(X_all), 128):
-            all_preds.append(model(X_all[i : i + 128]).argmax(1).cpu().numpy())
-    pred_indices = np.concatenate(all_preds)
+            all_logits.append(model(X_all[i : i + 128]).cpu())
+    all_logits = torch.cat(all_logits)
+
+    # Refine confusable predictions with template matching when available
+    ref_averages = None
+    if os.path.exists(AVERAGES_PATH):
+        ref_averages = np.load(AVERAGES_PATH)
+    if ref_averages is not None:
+        pred_indices = refine_confusables(all_logits, visuals, ref_averages)
+    else:
+        pred_indices = all_logits.argmax(1).numpy()
 
     if not args.quiet:
         out_f = open(args.output, "w", encoding="utf-8") if args.output else sys.stdout
